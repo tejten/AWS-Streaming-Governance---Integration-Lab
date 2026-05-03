@@ -1,0 +1,28 @@
+{
+  "TargetMetadata": {
+    "TargetSchema": "",
+    "SupportLobs": true,
+    "FullLobMode": false,
+    "LimitedSizeLobMode": true,
+    "LobMaxSize": 64
+  },
+  "FullLoadSettings": {
+    "TargetTablePrepMode": "DO_NOTHING",
+    "StopTaskCachedChangesApplied": false,
+    "StopTaskCachedChangesNotApplied": false,
+    "MaxFullLoadSubTasks": 8
+  },
+  "Logging": {
+    "EnableLogging": true
+  },
+  "ControlTablesSettings": {
+    "historyTimeslotInMinutes": 5,
+    "ControlSchema": "dms_control",
+    "HistoryTimeslotInMinutes": 5
+  },
+  "ChangeProcessingTuning": {
+    "BatchApplyPreserveTransaction": true,
+    "BatchApplyTimeoutMin": 1,
+    "BatchApplyTimeoutMax": 30
+  }
+}

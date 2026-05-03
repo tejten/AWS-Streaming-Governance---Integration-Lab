@@ -1,0 +1,3 @@
+{"event_id":"S-7001","order_id":"O-1001","shipment_status":"LABEL_CREATED","carrier":"UPS","tracking_number":"1Z999AA101","event_ts":"2026-04-30T13:12:00Z"}
+{"event_id":"S-7002","order_id":"O-1001","shipment_status":"IN_TRANSIT","carrier":"UPS","tracking_number":"1Z999AA101","event_ts":"2026-04-30T13:25:00Z"}
+{"event_id":"S-7003","order_id":"O-1002","shipment_status":"PENDING","carrier":"FEDEX","tracking_number":null,"event_ts":"2026-04-30T13:15:00Z"}

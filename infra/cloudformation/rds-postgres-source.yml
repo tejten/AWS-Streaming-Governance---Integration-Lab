@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Small PostgreSQL source database for the streaming governance DMS CDC demo.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamgov
+    AllowedPattern: "[a-z0-9]+"
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9]+"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the RDS subnet group. Use the same VPC as MSK/DMS.
+  AdminClientCidr:
+    Type: String
+    Description: Public client CIDR allowed to connect to PostgreSQL for demo seeding, for example 203.0.113.10/32.
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  SourceDbName:
+    Type: String
+    Default: orders
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9_]*"
+  MasterUsername:
+    Type: String
+    Default: streamgovadmin
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DbEngineVersion:
+    Type: String
+    Default: "16.6"
+  DbParameterGroupFamily:
+    Type: String
+    Default: postgres16
+  AllocatedStorageGiB:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+
+Resources:
+  SourceDbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}/${EnvironmentName}/rds/orders-source
+      Description: Master credentials for the demo PostgreSQL source database.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${MasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  SourceDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub Subnets for ${ProjectName}-${EnvironmentName} orders source database.
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  SourceDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub PostgreSQL source access for ${ProjectName}-${EnvironmentName}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref AdminClientCidr
+          Description: Temporary local client access for seeding demo data.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-orders-source
+
+  SourceDbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub PostgreSQL logical replication settings for ${ProjectName}-${EnvironmentName}.
+      Family: !Ref DbParameterGroupFamily
+      Parameters:
+        rds.logical_replication: "1"
+        max_replication_slots: "10"
+        max_wal_senders: "10"
+
+  SourceDbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${EnvironmentName}-orders-source
+      DBName: !Ref SourceDbName
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref AllocatedStorageGiB
+      StorageType: gp2
+      StorageEncrypted: true
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${SourceDbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref SourceDbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref SourceDbSecurityGroup
+      DBParameterGroupName: !Ref SourceDbParameterGroup
+      BackupRetentionPeriod: 1
+      PubliclyAccessible: true
+      MultiAZ: false
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: false
+      DeleteAutomatedBackups: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  SourceDbEndpoint:
+    Value: !GetAtt SourceDbInstance.Endpoint.Address
+  SourceDbPort:
+    Value: !GetAtt SourceDbInstance.Endpoint.Port
+  SourceDbName:
+    Value: !Ref SourceDbName
+  SourceDbUser:
+    Value: !Ref MasterUsername
+  SourceDbSecretArn:
+    Value: !Ref SourceDbSecret
+  SourceDbSecurityGroupId:
+    Value: !Ref SourceDbSecurityGroup

@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "include-sales-orders",
+      "object-locator": {
+        "schema-name": "sales",
+        "table-name": "orders"
+      },
+      "rule-action": "include"
+    }
+  ]
+}

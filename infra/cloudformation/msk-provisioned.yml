@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Provisioned Amazon MSK cluster for DMS CDC and Glue streaming lab.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamgov
+    AllowedPattern: "[a-z0-9]+"
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9]+"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or three private subnets in distinct Availability Zones.
+  VpcRouteTableIds:
+    Type: List<String>
+    Description: Route table IDs associated with the Glue/MSK private subnets for S3 gateway endpoint routing.
+  GlueConnectionAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+    Description: Availability Zone for the Glue VPC connection subnet.
+  ClientCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR allowed to connect to MSK client ports.
+  KafkaVersion:
+    Type: String
+    Default: 3.6.0
+  BrokerInstanceType:
+    Type: String
+    Default: kafka.t3.small
+  BrokerNodeCount:
+    Type: Number
+    Default: 2
+    AllowedValues:
+      - 2
+      - 3
+    Description: Match this to the number of private subnets/AZs used by the cluster.
+  BrokerVolumeSizeGiB:
+    Type: Number
+    Default: 100
+  TopicReplicationFactor:
+    Type: Number
+    Default: 2
+    AllowedValues:
+      - 2
+      - 3
+    Description: Must be less than or equal to BrokerNodeCount.
+  MinInSyncReplicas:
+    Type: Number
+    Default: 1
+    AllowedValues:
+      - 1
+      - 2
+    Description: For a two-broker dev cluster use 1; for a three-broker cluster use 2.
+
+Resources:
+  MskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/msk/${ProjectName}-${EnvironmentName}
+      RetentionInDays: 14
+
+  MskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub MSK client access for ${ProjectName}-${EnvironmentName}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9094
+          ToPort: 9098
+          CidrIp: !Ref ClientCidr
+          Description: TLS, SASL/SCRAM, and IAM Kafka clients.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-msk
+
+  GlueStreamingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Glue streaming job access for ${ProjectName}-${EnvironmentName}
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-glue-streaming
+
+  GlueStreamingSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GlueStreamingSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref GlueStreamingSecurityGroup
+      Description: Allow Glue Spark executors to communicate inside the job security group.
+
+  AllowGlueToMskScram:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9096
+      ToPort: 9096
+      SourceSecurityGroupId: !Ref GlueStreamingSecurityGroup
+      Description: Allow Glue streaming job to consume MSK over SASL/SCRAM.
+
+  SecretsManagerEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Secrets Manager VPC endpoint access for ${ProjectName}-${EnvironmentName}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref GlueStreamingSecurityGroup
+          Description: Allow Glue job to read SCRAM secret through the VPC endpoint.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-secretsmanager-endpoint
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref VpcRouteTableIds
+
+  SecretsManagerInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref SecretsManagerEndpointSecurityGroup
+
+  GlueMskNetworkConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub ${ProjectName}-${EnvironmentName}-msk-vpc
+        Description: !Sub VPC connection for Glue streaming jobs to reach ${ProjectName}-${EnvironmentName} MSK.
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !Ref GlueConnectionAvailabilityZone
+          SubnetId: !Select [0, !Ref PrivateSubnetIds]
+          SecurityGroupIdList:
+            - !Ref GlueStreamingSecurityGroup
+
+  MskScramKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub KMS key for ${ProjectName}-${EnvironmentName} MSK SCRAM secret.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowSecretsManagerUseForMskScramSecret
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+
+  MskScramSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub AmazonMSK_${ProjectName}_${EnvironmentName}_dms
+      Description: SASL/SCRAM credentials used by AWS DMS to publish CDC events to MSK.
+      KmsKeyId: !Ref MskScramKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"dms_cdc"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  MskScramSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref MskScramSecret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowMskServiceRead
+            Effect: Allow
+            Principal:
+              Service: kafka.amazonaws.com
+            Action: secretsmanager:GetSecretValue
+            Resource: "*"
+
+  MskConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-cdc-config
+      Description: Lab configuration. Production should explicitly manage topics and usually disable auto-create.
+      KafkaVersionsList:
+        - !Ref KafkaVersion
+      ServerProperties: !Sub |
+        auto.create.topics.enable=true
+        default.replication.factor=${TopicReplicationFactor}
+        min.insync.replicas=${MinInSyncReplicas}
+        num.partitions=6
+
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${EnvironmentName}-cdc
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: !Ref BrokerNodeCount
+      EnhancedMonitoring: PER_TOPIC_PER_BROKER
+      ConfigurationInfo:
+        Arn: !GetAtt MskConfiguration.Arn
+        Revision: 1
+      BrokerNodeGroupInfo:
+        ClientSubnets: !Ref PrivateSubnetIds
+        InstanceType: !Ref BrokerInstanceType
+        SecurityGroups:
+          - !Ref MskSecurityGroup
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref BrokerVolumeSizeGiB
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+          Scram:
+            Enabled: true
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup: !Ref MskLogGroup
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+
+  MskScramAssociation:
+    Type: AWS::MSK::BatchScramSecret
+    DependsOn:
+      - MskCluster
+      - MskScramSecretPolicy
+    Properties:
+      ClusterArn: !Ref MskCluster
+      SecretArnList:
+        - !Ref MskScramSecret
+
+  OrdersCdcTopic:
+    Type: AWS::MSK::Topic
+    DependsOn: MskScramAssociation
+    Properties:
+      ClusterArn: !Ref MskCluster
+      TopicName: cdc.sales.orders
+      PartitionCount: 6
+      ReplicationFactor: !Ref TopicReplicationFactor
+
+  ShipmentsTopic:
+    Type: AWS::MSK::Topic
+    DependsOn: MskScramAssociation
+    Properties:
+      ClusterArn: !Ref MskCluster
+      TopicName: external.shipments
+      PartitionCount: 6
+      ReplicationFactor: !Ref TopicReplicationFactor
+
+  DeadLetterTopic:
+    Type: AWS::MSK::Topic
+    DependsOn: MskScramAssociation
+    Properties:
+      ClusterArn: !Ref MskCluster
+      TopicName: pipeline.dlq
+      PartitionCount: 3
+      ReplicationFactor: !Ref TopicReplicationFactor
+
+Outputs:
+  MskClusterArn:
+    Value: !Ref MskCluster
+  MskSecurityGroupId:
+    Value: !Ref MskSecurityGroup
+  MskScramSecretArn:
+    Value: !Ref MskScramSecret
+  GlueConnectionName:
+    Value: !Ref GlueMskNetworkConnection
+  GlueStreamingSecurityGroupId:
+    Value: !Ref GlueStreamingSecurityGroup
+  S3GatewayEndpointId:
+    Value: !Ref S3GatewayEndpoint
+  SecretsManagerInterfaceEndpointId:
+    Value: !Ref SecretsManagerInterfaceEndpoint
+  GetBootstrapBrokersCommand:
+    Value: !Sub aws kafka get-bootstrap-brokers --cluster-arn ${MskCluster}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/partner-shipment-event.schema.json",
+  "title": "Partner Shipment Event",
+  "type": "object",
+  "required": ["event_id", "order_id", "shipment_status", "event_ts"],
+  "properties": {
+    "event_id": {"type": "string"},
+    "order_id": {"type": "string"},
+    "shipment_status": {
+      "type": "string",
+      "enum": ["PENDING", "LABEL_CREATED", "IN_TRANSIT", "DELIVERED", "EXCEPTION", "RETURNED"]
+    },
+    "carrier": {"type": ["string", "null"]},
+    "tracking_number": {"type": ["string", "null"]},
+    "event_ts": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

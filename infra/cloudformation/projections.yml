@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Lambda projection and lineage functions for the streaming governance lab.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamgov
+    AllowedPattern: "[a-z0-9]+"
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9]+"
+  ArtifactBucketName:
+    Type: String
+  DataLakeBucketName:
+    Type: String
+  MongoDbSecretArn:
+    Type: String
+  MongoSyncWatermarkTableName:
+    Type: String
+  MongoSyncLambdaRoleArn:
+    Type: String
+  LineageEmitterLambdaRoleArn:
+    Type: String
+  MongoSyncSchedule:
+    Type: String
+    Default: rate(5 minutes)
+
+Resources:
+  MongoSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${EnvironmentName}-mongodb-sync
+      Description: Upsert curated customer_order_status records into MongoDB.
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Ref MongoSyncLambdaRoleArn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: lambda/mongodb_sync.zip
+      Environment:
+        Variables:
+          CURATED_BUCKET: !Ref DataLakeBucketName
+          CURATED_PREFIX: curated/customer_order_status_latest/
+          SYNC_MODE: athena
+          ATHENA_DATABASE: !Sub ${ProjectName}_${EnvironmentName}_curated
+          ATHENA_TABLE: customer_order_status_latest
+          ATHENA_OUTPUT_LOCATION: !Sub s3://${ArtifactBucketName}/athena-results/mongodb-sync/
+          MONGODB_SECRET_ARN: !Ref MongoDbSecretArn
+          WATERMARK_TABLE: !Ref MongoSyncWatermarkTableName
+          PIPELINE_NAME: customer_order_status_latest
+          MONGODB_DATABASE: commerce
+          MONGODB_COLLECTION: customer_order_status
+          METRIC_NAMESPACE: StreamingGovernance
+
+  LineageEmitterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${EnvironmentName}-lineage-emitter
+      Description: Write lineage event payloads to the governed S3 lineage prefix.
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Ref LineageEmitterLambdaRoleArn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactBucketName
+        S3Key: lambda/lineage_emitter.zip
+      Environment:
+        Variables:
+          LINEAGE_BUCKET: !Ref DataLakeBucketName
+          LINEAGE_PREFIX: governance/lineage/
+
+  MongoSyncScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-mongodb-sync-schedule
+      Description: Periodically sync curated lakehouse data to MongoDB.
+      ScheduleExpression: !Ref MongoSyncSchedule
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt MongoSyncFunction.Arn
+          Id: MongoSyncFunction
+
+  AllowEventsInvokeMongoSync:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MongoSyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MongoSyncScheduleRule.Arn
+
+  MongoSyncErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-mongodb-sync-errors
+      AlarmDescription: MongoDB sync Lambda errors detected.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MongoSyncFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  MongoSyncFunctionName:
+    Value: !Ref MongoSyncFunction
+  LineageEmitterFunctionName:
+    Value: !Ref LineageEmitterFunction

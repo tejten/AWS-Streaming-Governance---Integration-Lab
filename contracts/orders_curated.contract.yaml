@@ -1,0 +1,129 @@
+contract_id: customer_order_status_v1
+version: 1.0.0
+owner:
+  domain: commerce
+  team: data-platform
+  steward: data-steward@example.com
+description: Curated operational order status view used by analytics and MongoDB read models.
+service_level:
+  freshness_target_seconds: 300
+  completeness_target: 0.995
+  retention_days: 2555
+  consumers:
+    - analytics
+    - customer-support-api
+    - fulfillment-ops
+source_assets:
+  - name: sales.orders
+    type: aurora_postgresql_table
+    ingestion: aws_dms_cdc_to_msk
+  - name: partner.shipments
+    type: external_partner_event
+    ingestion: api_or_partner_kafka_topic
+target_assets:
+  - name: curated.customer_order_status
+    type: glue_catalog_table
+    location: s3://<lake-bucket>/curated/customer_order_status/
+    description: Append-style CDC history used for replay and audit.
+  - name: curated.customer_order_status_latest
+    type: glue_catalog_table
+    location: s3://<lake-bucket>/curated/customer_order_status_latest/
+    description: Latest-state table certified by Glue Data Quality for consumers.
+  - name: mongodb.customer_order_status
+    type: mongodb_collection
+primary_key:
+  - order_id
+columns:
+  - name: order_id
+    type: string
+    nullable: false
+    description: Stable business order identifier.
+    lf_tags:
+      sensitivity: internal
+      domain: commerce
+  - name: customer_id
+    type: string
+    nullable: false
+    description: Customer identifier. Treat as internal customer data.
+    lf_tags:
+      sensitivity: internal
+      domain: commerce
+  - name: order_ts
+    type: timestamp
+    nullable: false
+  - name: order_status
+    type: string
+    nullable: false
+    allowed_values:
+      - PLACED
+      - CONFIRMED
+      - SHIPPED
+      - CANCELLED
+      - RETURNED
+  - name: amount
+    type: double
+    nullable: false
+    constraints:
+      min: 0
+  - name: currency
+    type: string
+    nullable: false
+    allowed_values:
+      - USD
+      - CAD
+      - EUR
+  - name: shipment_status
+    type: string
+    nullable: true
+  - name: carrier
+    type: string
+    nullable: true
+  - name: tracking_number
+    type: string
+    nullable: true
+  - name: updated_at
+    type: timestamp
+    nullable: false
+  - name: cdc_operation
+    type: string
+    nullable: false
+    allowed_values:
+      - insert
+      - update
+      - load
+  - name: cdc_timestamp
+    type: timestamp
+    nullable: false
+  - name: source_transaction_id
+    type: string
+    nullable: true
+  - name: shipment_event_id
+    type: string
+    nullable: true
+  - name: shipment_event_ts
+    type: timestamp
+    nullable: true
+  - name: curation_ts
+    type: string
+    nullable: false
+  - name: ingest_date
+    type: string
+    nullable: false
+    description: S3 partition date assigned by the Glue streaming job.
+quality_ruleset: contracts/dq_orders_curated.dqdl
+lineage:
+  upstream:
+    - cdc.sales.orders
+    - external.shipments
+  downstream:
+    - curated.customer_order_status
+    - mongodb.customer_order_status
+change_management:
+  compatible_changes:
+    - add nullable column
+    - add new enum value after consumer notice
+  breaking_changes:
+    - rename column
+    - remove column
+    - change primary key
+    - change type

@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS DMS PostgreSQL/Aurora CDC replication to Amazon MSK Kafka target.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamgov
+    AllowedPattern: "[a-z0-9]+"
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9]+"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  MskSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  MskBootstrapBrokersSaslScram:
+    Type: String
+    Description: Comma-separated MSK SASL/SCRAM bootstrap brokers from get-bootstrap-brokers.
+  MskScramUsername:
+    Type: String
+    Default: dms_cdc
+  MskScramPassword:
+    Type: String
+    NoEcho: true
+  KafkaTopicName:
+    Type: String
+    Default: cdc.sales.orders
+  SourceDbHost:
+    Type: String
+  SourceDbPort:
+    Type: Number
+    Default: 5432
+  SourceDbName:
+    Type: String
+  SourceDbUser:
+    Type: String
+  SourceDbPassword:
+    Type: String
+    NoEcho: true
+  SourceDbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Optional source PostgreSQL security group to open for the DMS replication instance.
+  ReplicationInstanceClass:
+    Type: String
+    Default: dms.t3.medium
+  AllocatedStorage:
+    Type: Number
+    Default: 50
+
+Conditions:
+  HasSourceDbSecurityGroup: !Not [!Equals [!Ref SourceDbSecurityGroupId, ""]]
+
+Resources:
+  DmsVpcRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dms-vpc-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+
+  DmsCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dms-cloudwatch-logs-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
+
+  DmsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub DMS replication instance for ${ProjectName}-${EnvironmentName}
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AllowDmsToMskScram:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 9096
+      ToPort: 9096
+      SourceSecurityGroupId: !Ref DmsSecurityGroup
+      Description: Allow DMS to publish to MSK over SASL/SCRAM.
+
+  AllowDmsToSourcePostgres:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSourceDbSecurityGroup
+    Properties:
+      GroupId: !Ref SourceDbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref SourceDbPort
+      ToPort: !Ref SourceDbPort
+      SourceSecurityGroupId: !Ref DmsSecurityGroup
+      Description: Allow DMS to read PostgreSQL source data and CDC changes.
+
+  DmsReplicationSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    DependsOn: DmsVpcRole
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub ${ProjectName}-${EnvironmentName}-dms-subnets
+      ReplicationSubnetGroupDescription: Private subnets for DMS replication instance.
+      SubnetIds: !Ref SubnetIds
+
+  DmsReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceIdentifier: !Sub ${ProjectName}-${EnvironmentName}-cdc
+      ReplicationInstanceClass: !Ref ReplicationInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      PubliclyAccessible: false
+      MultiAZ: false
+      VpcSecurityGroupIds:
+        - !Ref DmsSecurityGroup
+      ReplicationSubnetGroupIdentifier: !Ref DmsReplicationSubnetGroup
+
+  PostgresSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${ProjectName}-${EnvironmentName}-orders-postgres
+      EndpointType: source
+      EngineName: postgres
+      ServerName: !Ref SourceDbHost
+      Port: !Ref SourceDbPort
+      DatabaseName: !Ref SourceDbName
+      Username: !Ref SourceDbUser
+      Password: !Ref SourceDbPassword
+      SslMode: require
+
+  KafkaTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${ProjectName}-${EnvironmentName}-orders-msk
+      EndpointType: target
+      EngineName: kafka
+      KafkaSettings:
+        Broker: !Ref MskBootstrapBrokersSaslScram
+        Topic: !Ref KafkaTopicName
+        MessageFormat: json
+        IncludeTransactionDetails: true
+        IncludeControlDetails: true
+        IncludePartitionValue: true
+        IncludeTableAlterOperations: true
+        IncludeNullAndEmpty: true
+        PartitionIncludeSchemaTable: true
+        SecurityProtocol: sasl-ssl
+        SaslUserName: !Ref MskScramUsername
+        SaslPassword: !Ref MskScramPassword
+
+  OrdersCdcTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub ${ProjectName}-${EnvironmentName}-orders-cdc-to-msk
+      MigrationType: full-load-and-cdc
+      ReplicationInstanceArn: !Ref DmsReplicationInstance
+      SourceEndpointArn: !Ref PostgresSourceEndpoint
+      TargetEndpointArn: !Ref KafkaTargetEndpoint
+      TableMappings: |
+        {
+          "rules": [
+            {
+              "rule-type": "selection",
+              "rule-id": "1",
+              "rule-name": "include-sales-orders",
+              "object-locator": {
+                "schema-name": "sales",
+                "table-name": "orders"
+              },
+              "rule-action": "include"
+            }
+          ]
+        }
+      ReplicationTaskSettings: |
+        {
+          "TargetMetadata": {
+            "TargetSchema": "",
+            "SupportLobs": true,
+            "FullLobMode": false,
+            "LimitedSizeLobMode": true,
+            "LobMaxSize": 64
+          },
+          "FullLoadSettings": {
+            "TargetTablePrepMode": "DO_NOTHING",
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8
+          },
+          "Logging": {
+            "EnableLogging": true
+          },
+          "ControlTablesSettings": {
+            "historyTimeslotInMinutes": 5,
+            "ControlSchema": "dms_control",
+            "HistoryTimeslotInMinutes": 5
+          },
+          "ChangeProcessingTuning": {
+            "BatchApplyPreserveTransaction": true,
+            "BatchApplyTimeoutMin": 1,
+            "BatchApplyTimeoutMax": 30
+          }
+        }
+
+Outputs:
+  DmsReplicationTaskArn:
+    Value: !Ref OrdersCdcTask
+  DmsReplicationInstanceArn:
+    Value: !Ref DmsReplicationInstance
+  KafkaTargetEndpointArn:
+    Value: !Ref KafkaTargetEndpoint

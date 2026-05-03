@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/dms-order-cdc.schema.json",
+  "title": "DMS Order CDC Event",
+  "type": "object",
+  "required": ["metadata", "data"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["operation", "schema-name", "table-name", "timestamp"],
+      "properties": {
+        "record-type": {"type": "string"},
+        "operation": {"type": "string", "enum": ["insert", "update", "delete", "load"]},
+        "schema-name": {"type": "string"},
+        "table-name": {"type": "string"},
+        "timestamp": {"type": "string", "format": "date-time"},
+        "transaction-id": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "data": {
+      "type": "object",
+      "required": ["order_id"],
+      "properties": {
+        "order_id": {"type": "string"},
+        "customer_id": {"type": ["string", "null"]},
+        "order_ts": {"type": ["string", "null"], "format": "date-time"},
+        "status": {
+          "type": ["string", "null"],
+          "enum": ["PLACED", "CONFIRMED", "SHIPPED", "CANCELLED", "RETURNED", null]
+        },
+        "amount": {"type": ["number", "null"], "minimum": 0},
+        "currency": {"type": ["string", "null"], "enum": ["USD", "CAD", "EUR", null]},
+        "updated_at": {"type": ["string", "null"], "format": "date-time"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

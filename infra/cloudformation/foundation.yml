@@ -1,0 +1,904 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Foundation for the AWS Streaming Governance & Integration Lab.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamgov
+    AllowedPattern: "[a-z0-9]+"
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9]+"
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscription for SNS pipeline alerts.
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  DataLakeKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub KMS key for ${ProjectName}-${EnvironmentName} lakehouse data.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowLakeFormationDataAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:GenerateDataKey
+            Resource: "*"
+
+  DataLakeKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}-${EnvironmentName}-lakehouse
+      TargetKeyId: !Ref DataLakeKey
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${EnvironmentName}-lake-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataLakeKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: NonProdBronzeRetention
+            Status: Enabled
+            Prefix: bronze/
+            ExpirationInDays: 30
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${EnvironmentName}-artifacts-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${EnvironmentName}-pipeline-alerts
+
+  PipelineAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Endpoint: !Ref NotificationEmail
+      Protocol: email
+      TopicArn: !Ref PipelineAlertsTopic
+
+  MongoDbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}/${EnvironmentName}/mongodb
+      Description: Replace the placeholder URI with MongoDB Atlas or Amazon DocumentDB connection details.
+      SecretString: '{"uri":"mongodb+srv://replace-me.example.mongodb.net/?retryWrites=true&w=majority"}'
+
+  MongoSyncWatermarkTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${EnvironmentName}-mongo-sync-watermarks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pipeline_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pipeline_name
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  DataEngineerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-data-engineer
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+      Policies:
+        - PolicyName: lakehouse-engineer-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub ${DataLakeBucket.Arn}/*
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - lakeformation:*
+                  - glue:*
+                  - athena:*
+                Resource: "*"
+
+  DataAnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-data-analyst
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: query-governed-catalog
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:*
+                  - glue:Get*
+                  - glue:SearchTables
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub ${DataLakeBucket.Arn}/curated/*
+
+  DataStewardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-data-steward
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: stewardship
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:Get*
+                  - glue:List*
+                  - glue:SearchTables
+                  - glue:StartDataQualityRulesetEvaluationRun
+                  - glue:GetDataQuality*
+                  - glue:ListDataQuality*
+                  - lakeformation:List*
+                  - lakeformation:Get*
+                  - lakeformation:SearchTablesByLFTags
+                Resource: "*"
+
+  GlueStreamingJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-glue-streaming-job
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: glue-streaming-lakehouse
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub ${DataLakeBucket.Arn}/*
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataLakeKey.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  - kafka-cluster:DescribeTopic
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:AlterGroup
+                  - kafka-cluster:DescribeGroup
+                Resource: "*"
+
+  MongoSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-mongo-sync-lambda
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: mongo-sync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub ${DataLakeBucket.Arn}/curated/*
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/athena-results/*
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucketMultipartUploads
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/athena-results/*
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt DataLakeKey.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref MongoDbSecret
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt MongoSyncWatermarkTable.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  LineageEmitterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-lineage-emitter-lambda
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: write-lineage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${DataLakeBucket.Arn}/governance/lineage/*
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataLakeKey.Arn
+
+  BronzeDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${EnvironmentName}_bronze
+        Description: Raw event preservation zone.
+
+  SilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${EnvironmentName}_silver
+        Description: Normalized entity state zone.
+
+  CuratedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${EnvironmentName}_curated
+        Description: Contracted governed data products.
+
+  GovernanceDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${EnvironmentName}_governance
+        Description: Data quality, lineage, and operational metadata.
+
+  CuratedOrderStatusTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CuratedDatabase
+      TableInput:
+        Name: customer_order_status
+        Description: Curated order and shipment status for analytics and MongoDB projection.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          compressionType: none
+          typeOfData: file
+          data_contract: customer_order_status_v1
+          projection.enabled: "true"
+          projection.ingest_date.type: date
+          projection.ingest_date.range: "2026-01-01,NOW"
+          projection.ingest_date.format: "yyyy-MM-dd"
+          storage.location.template: !Sub s3://${DataLakeBucket}/curated/customer_order_status/ingest_date=${!ingest_date}/
+        PartitionKeys:
+          - Name: ingest_date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub s3://${DataLakeBucket}/curated/customer_order_status/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: order_id
+              Type: string
+            - Name: customer_id
+              Type: string
+            - Name: order_ts
+              Type: timestamp
+            - Name: order_status
+              Type: string
+            - Name: amount
+              Type: double
+            - Name: currency
+              Type: string
+            - Name: shipment_status
+              Type: string
+            - Name: carrier
+              Type: string
+            - Name: tracking_number
+              Type: string
+            - Name: updated_at
+              Type: timestamp
+            - Name: cdc_operation
+              Type: string
+            - Name: cdc_timestamp
+              Type: timestamp
+            - Name: source_transaction_id
+              Type: string
+            - Name: shipment_event_id
+              Type: string
+            - Name: shipment_event_ts
+              Type: timestamp
+            - Name: curation_ts
+              Type: string
+
+  CuratedOrderStatusLatestTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CuratedDatabase
+      TableInput:
+        Name: customer_order_status_latest
+        Description: Latest non-delete order and shipment status per order_id for quality-gated consumption.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          compressionType: none
+          typeOfData: file
+          data_contract: customer_order_status_v1
+        StorageDescriptor:
+          Location: !Sub s3://${DataLakeBucket}/curated/customer_order_status_latest/
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: order_id
+              Type: string
+            - Name: customer_id
+              Type: string
+            - Name: order_ts
+              Type: timestamp
+            - Name: order_status
+              Type: string
+            - Name: amount
+              Type: double
+            - Name: currency
+              Type: string
+            - Name: shipment_status
+              Type: string
+            - Name: carrier
+              Type: string
+            - Name: tracking_number
+              Type: string
+            - Name: updated_at
+              Type: timestamp
+            - Name: cdc_operation
+              Type: string
+            - Name: cdc_timestamp
+              Type: timestamp
+            - Name: source_transaction_id
+              Type: string
+            - Name: shipment_event_id
+              Type: string
+            - Name: shipment_event_ts
+              Type: timestamp
+            - Name: curation_ts
+              Type: string
+            - Name: source_ingest_date
+              Type: string
+            - Name: snapshot_ts
+              Type: timestamp
+
+  LineageEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GovernanceDatabase
+      TableInput:
+        Name: lineage_events
+        Description: Table-level lineage events emitted by pipelines.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          typeOfData: file
+        PartitionKeys:
+          - Name: run_date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub s3://${DataLakeBucket}/governance/lineage/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - Name: run_id
+              Type: string
+            - Name: run_ts
+              Type: string
+            - Name: producer
+              Type: string
+            - Name: inputs
+              Type: array<string>
+            - Name: outputs
+              Type: array<string>
+            - Name: quality
+              Type: string
+            - Name: metrics
+              Type: string
+
+  CuratedOrderStatusRuleset:
+    Type: AWS::Glue::DataQualityRuleset
+    Properties:
+      Name: !Sub ${ProjectName}_${EnvironmentName}_customer_order_status_rules
+      Description: Data quality checks for curated order status table.
+      TargetTable:
+        DatabaseName: !Ref CuratedDatabase
+        TableName: !Ref CuratedOrderStatusTable
+      Ruleset: |
+        Rules = [
+          IsComplete "order_id",
+          IsUnique "order_id",
+          IsComplete "customer_id",
+          IsComplete "updated_at",
+          ColumnValues "amount" >= 0,
+          ColumnValues "currency" in ["USD", "CAD", "EUR"],
+          ColumnValues "order_status" in ["PLACED", "CONFIRMED", "SHIPPED", "CANCELLED", "RETURNED"],
+          Completeness "cdc_timestamp" > 0.99,
+          RowCount > 0
+        ]
+
+  CuratedOrderStatusLatestRuleset:
+    Type: AWS::Glue::DataQualityRuleset
+    Properties:
+      Name: !Sub ${ProjectName}_${EnvironmentName}_customer_order_status_latest_rules
+      Description: Data quality checks for the latest-state curated order status table.
+      TargetTable:
+        DatabaseName: !Ref CuratedDatabase
+        TableName: !Ref CuratedOrderStatusLatestTable
+      Ruleset: |
+        Rules = [
+          IsComplete "order_id",
+          IsUnique "order_id",
+          IsComplete "customer_id",
+          IsComplete "updated_at",
+          ColumnValues "amount" >= 0,
+          ColumnValues "currency" in ["USD", "CAD", "EUR"],
+          ColumnValues "order_status" in ["PLACED", "CONFIRMED", "SHIPPED", "CANCELLED", "RETURNED"],
+          Completeness "cdc_timestamp" > 0.99,
+          RowCount > 0
+        ]
+
+  RegisteredLakeBucket:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !GetAtt DataLakeBucket.Arn
+      UseServiceLinkedRole: true
+
+  DomainTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: domain
+      TagValues:
+        - commerce
+        - governance
+
+  SensitivityTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: sensitivity
+      TagValues:
+        - public
+        - internal
+        - confidential
+
+  QualityTierTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: quality_tier
+      TagValues:
+        - bronze
+        - silver
+        - curated
+
+  CuratedDatabaseTags:
+    Type: AWS::LakeFormation::TagAssociation
+    DependsOn:
+      - CuratedDatabase
+      - DomainTag
+      - SensitivityTag
+      - QualityTierTag
+    Properties:
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref CuratedDatabase
+      LFTags:
+        - CatalogId: !Ref AWS::AccountId
+          TagKey: domain
+          TagValues:
+            - commerce
+        - CatalogId: !Ref AWS::AccountId
+          TagKey: sensitivity
+          TagValues:
+            - internal
+        - CatalogId: !Ref AWS::AccountId
+          TagKey: quality_tier
+          TagValues:
+            - curated
+
+  GlueStreamingCuratedDatabaseAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: CuratedDatabase
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueStreamingJobRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref CuratedDatabase
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  GlueStreamingCuratedTableAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn:
+      - CuratedOrderStatusTable
+      - CuratedDatabaseTags
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueStreamingJobRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref CuratedDatabase
+          Name: !Ref CuratedOrderStatusTable
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      PermissionsWithGrantOption: []
+
+  GlueStreamingLatestTableAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn:
+      - CuratedOrderStatusLatestTable
+      - CuratedDatabaseTags
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueStreamingJobRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref CuratedDatabase
+          Name: !Ref CuratedOrderStatusLatestTable
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      PermissionsWithGrantOption: []
+
+  GlueStreamingDataLocationAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: RegisteredLakeBucket
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueStreamingJobRole.Arn
+      Resource:
+        DataLocation:
+          CatalogId: !Ref AWS::AccountId
+          ResourceArn: !GetAtt DataLakeBucket.Arn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+
+  MongoSyncCuratedDatabaseAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: CuratedDatabase
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt MongoSyncLambdaRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref CuratedDatabase
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  MongoSyncLatestTableAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn:
+      - CuratedOrderStatusLatestTable
+      - CuratedDatabaseTags
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt MongoSyncLambdaRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref CuratedDatabase
+          Name: !Ref CuratedOrderStatusLatestTable
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      PermissionsWithGrantOption: []
+
+  MongoSyncDataLocationAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: RegisteredLakeBucket
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt MongoSyncLambdaRole.Arn
+      Resource:
+        DataLocation:
+          CatalogId: !Ref AWS::AccountId
+          ResourceArn: !GetAtt DataLakeBucket.Arn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+
+  AnalystCuratedAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: CuratedDatabaseTags
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt DataAnalystRole.Arn
+      Resource:
+        LFTagPolicy:
+          CatalogId: !Ref AWS::AccountId
+          ResourceType: TABLE
+          Expression:
+            - TagKey: sensitivity
+              TagValues:
+                - public
+                - internal
+            - TagKey: quality_tier
+              TagValues:
+                - curated
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      PermissionsWithGrantOption: []
+
+  StewardDescribeAccess:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: CuratedDatabaseTags
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt DataStewardRole.Arn
+      Resource:
+        LFTagPolicy:
+          CatalogId: !Ref AWS::AccountId
+          ResourceType: DATABASE
+          Expression:
+            - TagKey: domain
+              TagValues:
+                - commerce
+                - governance
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-${EnvironmentName}-streaming-governance
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 3,
+              "properties": {
+                "markdown": "# ${ProjectName}-${EnvironmentName} streaming governance dashboard\nMonitor DMS latency, MSK broker health, Glue streaming jobs, data quality, and MongoDB projection metrics."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 3,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["StreamingGovernance", "MongoUpserts"],
+                  [".", "MongoDeletes"],
+                  [".", "ProcessedObjects"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "MongoDB projection sync"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 3,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Glue", "glue.driver.aggregate.numCompletedTasks", "JobName", "${ProjectName}-${EnvironmentName}-msk-to-lakehouse"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Glue streaming progress"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  DataLakeKmsKeyArn:
+    Value: !GetAtt DataLakeKey.Arn
+  GlueStreamingJobRoleArn:
+    Value: !GetAtt GlueStreamingJobRole.Arn
+  MongoSyncLambdaRoleArn:
+    Value: !GetAtt MongoSyncLambdaRole.Arn
+  LineageEmitterLambdaRoleArn:
+    Value: !GetAtt LineageEmitterLambdaRole.Arn
+  MongoDbSecretArn:
+    Value: !Ref MongoDbSecret
+  MongoSyncWatermarkTableName:
+    Value: !Ref MongoSyncWatermarkTable
+  CuratedDatabaseName:
+    Value: !Ref CuratedDatabase
+  CuratedOrderStatusTableName:
+    Value: !Ref CuratedOrderStatusTable
+  CuratedOrderStatusLatestTableName:
+    Value: !Ref CuratedOrderStatusLatestTable
+  CuratedOrderStatusRulesetName:
+    Value: !Ref CuratedOrderStatusRuleset
+  CuratedOrderStatusLatestRulesetName:
+    Value: !Ref CuratedOrderStatusLatestRuleset
+  PipelineAlertsTopicArn:
+    Value: !Ref PipelineAlertsTopic

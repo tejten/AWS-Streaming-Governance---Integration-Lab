@@ -1,0 +1,17 @@
+Rules = [
+  IsComplete "order_id",
+  IsUnique "order_id",
+  IsComplete "customer_id",
+  IsComplete "updated_at",
+  ColumnValues "amount" >= 0,
+  ColumnValues "currency" in ["USD", "CAD", "EUR"],
+  ColumnValues "order_status" in ["PLACED", "CONFIRMED", "SHIPPED", "CANCELLED", "RETURNED"],
+  Completeness "cdc_timestamp" > 0.99,
+  RowCount > 0
+]
+
+Analyzers = [
+  RowCount,
+  Completeness "customer_id",
+  DistinctValuesCount "currency"
+]
