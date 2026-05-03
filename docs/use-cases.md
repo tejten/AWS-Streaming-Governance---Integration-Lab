@@ -28,7 +28,7 @@
 
 **Problem:** Bad lakehouse records should not poison MongoDB read models.
 
-**Flow:** Glue Data Quality evaluates `customer_order_status` using DQDL rules. If quality passes, the MongoDB sync Lambda upserts records. If quality fails, CloudWatch/SNS alerts fire and the sync can be paused.
+**Flow:** Athena compacts the append-style `customer_order_status` history into `customer_order_status_latest`. Glue Data Quality evaluates the latest-state table using DQDL rules. If quality passes, the certified publish gate invokes MongoDB sync. If quality fails, CloudWatch/SNS alerts fire and the sync is blocked.
 
 **You can discuss:** DQ thresholds, failed-record handling, EventBridge schedules, quality trend metrics, and rollback.
 
@@ -36,7 +36,7 @@
 
 **Problem:** Customer support APIs need fast document lookups by order ID.
 
-**Flow:** Lambda reads newly published curated JSON/Parquet manifest partitions, uses DynamoDB watermarks for idempotency, and upserts MongoDB documents keyed by `order_id`.
+**Flow:** Lambda queries the certified `customer_order_status_latest` Glue/Athena table, uses DynamoDB watermarks for idempotency, and upserts MongoDB documents keyed by `order_id`.
 
 **You can discuss:** Exactly-once vs effectively-once sync, watermarks, retry behavior, duplicate suppression, and source-of-truth boundaries.
 

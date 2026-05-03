@@ -36,16 +36,16 @@
 
 ### MongoDB Projection Drift
 
-1. Compare DynamoDB watermark with latest curated object/partition.
+1. Compare the DynamoDB watermark with the latest certified `snapshot_ts` in Athena.
 2. Check Lambda timeout, memory, and MongoDB connection errors.
-3. Re-run sync for the affected prefix after resetting watermark to the last known good object.
+3. Re-run sync after resetting the watermark to the last known good certified snapshot.
 4. Validate counts against Athena/Glue table row counts.
 
 ## Replay Strategy
 
 - Kafka replay: reset consumer group offsets or start a new Glue checkpoint path.
 - Lake replay: rewrite target partitions after staging validation.
-- MongoDB replay: reset DynamoDB watermark and upsert curated records again.
+- MongoDB replay: reset DynamoDB watermark and upsert certified Athena rows again.
 - DMS replay: use a new task or CDC start position only after confirming source log availability.
 
 ## Cost Controls

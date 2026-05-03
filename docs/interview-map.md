@@ -21,6 +21,7 @@ Use this project to answer role-specific questions with concrete examples.
 - Bronze keeps raw events for replay.
 - Silver collapses CDC into normalized latest state.
 - Curated is contract-driven and quality-gated.
+- Latest-state compaction produces `customer_order_status_latest` for operational projections.
 - Glue streaming jobs use checkpoints rather than bookmarks.
 
 ## Governance
@@ -39,6 +40,7 @@ Use this project to answer role-specific questions with concrete examples.
 ## MongoDB Sync
 
 - Treat MongoDB as an operational projection, not the lakehouse source of truth.
+- Query the certified Glue/Athena latest-state table; do not scrape arbitrary S3 files.
 - Use idempotent upserts by `order_id`.
 - Store watermarks in DynamoDB.
 - Replays should be safe because documents are replaced by deterministic keys.
