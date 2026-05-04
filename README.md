@@ -234,6 +234,8 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 
 Delete demo resources in reverse dependency order when you are done. The teardown script removes the Glue streaming job created by `scripts/aws/create_glue_streaming_job.sh`, deletes the DMS/projection/MSK/foundation CloudFormation stacks, empties the demo S3 buckets, removes Lambda log groups for the projection functions, and purges demo Secrets Manager secrets if CloudFormation leaves them in a recovery window.
 
+The teardown is VPC-preserving: the demo stacks reference an existing VPC by parameter, and the script refuses to delete any stack that owns VPC-level resources such as a VPC, subnets, route tables, NAT gateways, internet gateways, or VPC gateway attachments.
+
 ```bash
 scripts/aws/teardown_demo.sh --project streamgov --env dev
 ```

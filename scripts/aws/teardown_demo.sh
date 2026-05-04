@@ -7,6 +7,7 @@ Usage:
   scripts/aws/teardown_demo.sh [options]
 
 Deletes AWS resources created by the Streaming Governance & Integration demo.
+Preserves the VPC, subnets, and route tables supplied to the demo stacks.
 
 Options:
   --project NAME             Project name used in stack names. Default: streamgov
@@ -30,7 +31,12 @@ Default stack names:
   streamgov-rds-source-dev
 
 The script deletes resources in dependency order:
-  Glue job -> DMS stack -> RDS source stack -> projection stack -> MSK stack -> S3 contents -> foundation stack
+  Glue job -> DMS stack -> RDS source stack -> projection stack -> MSK service stack -> S3 contents -> foundation stack
+
+VPC preservation guard:
+  The script refuses to delete any CloudFormation stack that owns VPC-level
+  network resources such as AWS::EC2::VPC, subnets, route tables, NAT gateways,
+  internet gateways, or VPC gateway attachments.
 EOF
 }
 
@@ -121,7 +127,11 @@ warn() {
 }
 
 aws_call() {
-  aws "${AWS_ARGS[@]}" "$@"
+  if ((${#AWS_ARGS[@]})); then
+    aws "${AWS_ARGS[@]}" "$@"
+  else
+    aws "$@"
+  fi
 }
 
 require_command() {
@@ -154,6 +164,28 @@ stack_output() {
   printf '%s' "$value"
 }
 
+stack_owned_vpc_resources() {
+  local stack_name="$1"
+
+  aws_call cloudformation list-stack-resources \
+    --stack-name "$stack_name" \
+    --query 'StackResourceSummaries[?ResourceType==`AWS::EC2::VPC` || ResourceType==`AWS::EC2::Subnet` || ResourceType==`AWS::EC2::RouteTable` || ResourceType==`AWS::EC2::InternetGateway` || ResourceType==`AWS::EC2::NatGateway` || ResourceType==`AWS::EC2::VPCGatewayAttachment`].[LogicalResourceId,ResourceType,PhysicalResourceId]' \
+    --output text 2>/dev/null || true
+}
+
+assert_stack_does_not_own_vpc_resources() {
+  local stack_name="$1"
+  local network_resources
+
+  network_resources="$(stack_owned_vpc_resources "$stack_name")"
+  if [[ -n "$network_resources" && "$network_resources" != "None" ]]; then
+    warn "Refusing to delete ${stack_name}; it owns VPC-level network resources."
+    printf '%s\n' "$network_resources" >&2
+    warn "This teardown is intentionally VPC-preserving. Delete those network resources manually only if you intend to remove them."
+    exit 1
+  fi
+}
+
 delete_stack() {
   local stack_name="$1"
 
@@ -161,6 +193,8 @@ delete_stack() {
     log "CloudFormation stack ${stack_name} not found; skipping."
     return
   fi
+
+  assert_stack_does_not_own_vpc_resources "$stack_name"
 
   log "Deleting CloudFormation stack: ${stack_name}"
   aws_call cloudformation delete-stack --stack-name "$stack_name"
@@ -270,11 +304,19 @@ empty_foundation_buckets() {
   lake_bucket="$(stack_output "$FOUNDATION_STACK" DataLakeBucketName)"
 
   if [[ -n "$artifact_bucket" ]]; then
-    "$EMPTY_BUCKET_SCRIPT" "$artifact_bucket" "${AWS_ARGS[@]}"
+    if ((${#AWS_ARGS[@]})); then
+      "$EMPTY_BUCKET_SCRIPT" "$artifact_bucket" "${AWS_ARGS[@]}"
+    else
+      "$EMPTY_BUCKET_SCRIPT" "$artifact_bucket"
+    fi
   fi
 
   if [[ -n "$lake_bucket" ]]; then
-    "$EMPTY_BUCKET_SCRIPT" "$lake_bucket" "${AWS_ARGS[@]}"
+    if ((${#AWS_ARGS[@]})); then
+      "$EMPTY_BUCKET_SCRIPT" "$lake_bucket" "${AWS_ARGS[@]}"
+    else
+      "$EMPTY_BUCKET_SCRIPT" "$lake_bucket"
+    fi
   fi
 }
 
@@ -329,7 +371,9 @@ if [[ ! -x "$EMPTY_BUCKET_SCRIPT" ]]; then
   exit 1
 fi
 
-caller_arn="$(aws_call sts get-caller-identity --query Arn --output text 2>/dev/null || true)"
+if ! caller_arn="$(aws_call sts get-caller-identity --query Arn --output text 2>/dev/null)"; then
+  caller_arn="unknown"
+fi
 
 cat <<EOF
 This will delete AWS resources for:
@@ -351,6 +395,11 @@ Also deletes:
   Foundation S3 bucket contents before deleting the foundation stack
   Lambda log groups for the demo projection functions
   Demo Secrets Manager secrets if they remain in recovery
+
+VPC preservation:
+  This script does not delete the VPC, subnets, route tables, NAT gateways,
+  internet gateways, or VPC gateway attachments. It will stop if a target stack
+  owns any of those resources.
 EOF
 
 if [[ "$YES" != "1" ]]; then
@@ -369,9 +418,11 @@ fi
 delete_glue_job "${PROJECT_NAME}-msk-to-lakehouse"
 delete_glue_job "${PROJECT_NAME}-${ENVIRONMENT_NAME}-msk-to-lakehouse"
 
-for job_name in "${EXTRA_GLUE_JOBS[@]}"; do
-  delete_glue_job "$job_name"
-done
+if ((${#EXTRA_GLUE_JOBS[@]})); then
+  for job_name in "${EXTRA_GLUE_JOBS[@]}"; do
+    delete_glue_job "$job_name"
+  done
+fi
 
 stop_dms_task_from_stack "$DMS_STACK"
 delete_stack "$DMS_STACK"
